@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mood Galaxy</title>
+<style>
+  :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); --bg:#02030a; --fg:#e8eefc; --pill:rgba(255,255,255,.08); --on:rgba(255,255,255,.9); }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #ui { position: absolute; left: 0; right: 0; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 0 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  button, .file { background: var(--pill); color: var(--fg); border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: 9px 16px; font-size: 14px; cursor: pointer; backdrop-filter: blur(8px); }
+  button.on { background: var(--on); color: #02030a; }
+  #status { font-size: 12px; opacity: .55; }
+  #title { position: absolute; top: calc(18px + env(safe-area-inset-top, 0px)); left: 0; right: 0; text-align: center; font-size: 13px; letter-spacing: .2em; text-transform: uppercase; opacity: .6; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">Mood Galaxy</div>
+<div id="ui">
+  <div class="row" id="moods"></div>
+  <div class="row" id="shapes"></div>
+  <div class="row">
+    <button id="play">▶ Play</button>
+    <label class="file">Load your track<input id="file" type="file" accept="audio/*" hidden></label>
+    <button id="mic">🎤 Mic</button>
+    <button id="bloom" class="on">✦ Bloom</button>
+  </div>
+  <div id="status">Hover to float. Click for a shockwave, hold to pull. Press play to react.</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script>
+(function () {
+  /* ============ MOODS: each one is just a set of shader inputs + music settings ============ */
+  var MOODS = {
+    Chill:   { speed: .25, twist: 3.0, spread: .35, tint: [.55,.80,1.0], bpm: 72,  kick: [0,10], hat: [4,12], chords: [[220,261.6,329.6,392],[174.6,220,261.6,329.6]] },
+    Focus:   { speed: .35, twist: 3.6, spread: .22, tint: [.70,1.0,.85], bpm: 90,  kick: [0,8],  hat: [2,6,10,14], chords: [[146.8,174.6,220,261.6],[196,233.1,293.7,349.2]] },
+    Workout: { speed: .80, twist: 4.2, spread: .50, tint: [1.0,.50,.40], bpm: 128, kick: [0,4,8,12], hat: [2,6,10,14], chords: [[164.8,196,246.9,329.6],[130.8,164.8,196,261.6]] },
+    Night:   { speed: .18, twist: 2.4, spread: .45, tint: [.70,.55,1.0], bpm: 60,  kick: [0],     hat: [8], chords: [[110,130.8,164.8,196],[123.5,146.8,185,220]] }
+  };
+  var names = Object.keys(MOODS), mood = 'Chill';
+  var cur = { speed: .25, twist: 3.0, spread: .35, tint: [.55,.80,1.0] };   // eased values actually sent to the GPU
+
+  /* ============ THREE.JS: scene + particles ============ */
+  var canvas = document.getElementById('c');
+  var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(45, 1, 0.1, 200);
+  camera.position.z = 30;
+
+  var N = /Mobi|Android/i.test(navigator.userAgent) ? 22000 : 45000, CLUMPS = 600, CORE = 1200, R = 11;
+  var total = N + CLUMPS + CORE;
+  var A = { R: new Float32Array(total), Arm: new Float32Array(total), Sc: new Float32Array(total), Z: new Float32Array(total),
+            S: new Float32Array(total), Seed: new Float32Array(total), C: new Float32Array(total * 3) };
+  function gauss() { return (Math.random() + Math.random() + Math.random() - 1.5) / 1.5; }
+  var pal = [[.75,.88,1],[1,1,1],[.55,.75,1],[1,.72,.55]];
+  for (var i = 0; i < total; i++) {
+    var core = i >= N + CLUMPS, clump = !core && i >= N, r, arm, sc, size, col;
+    if (core) { r = Math.abs(gauss()) * 1.6; arm = Math.random() * 6.283; sc = 0; size = 2 + Math.random() * 5; col = [1,.97,.92]; }
+    else {
+      r = Math.pow(Math.random(), .75) * R + .6;
+      arm = Math.floor(Math.random() * 2) * 3.1416; sc = gauss();
+      size = clump ? 9 + Math.random() * 14 : 1.2 + Math.random() * 2.4;
+      col = pal[Math.random() < .18 ? 3 : Math.floor(Math.random() * 3)];
+    }
+    A.R[i] = r; A.Arm[i] = arm; A.Sc[i] = sc; A.Z[i] = gauss() * .25; A.S[i] = size; A.Seed[i] = Math.random() * 10; A.C.set(col, i * 3);
+  }
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(total * 3), 3));
+  ['R','Arm','Sc','Z','S','Seed'].forEach(function (k) { geo.setAttribute('a' + k, new THREE.BufferAttribute(A[k], 1)); });
+  geo.setAttribute('aC', new THREE.BufferAttribute(A.C, 3));
+  /* shape morphing: a second, static target position per particle */
+  var shapeBuf = new THREE.BufferAttribute(new Float32Array(total * 3), 3); geo.setAttribute('aShape', shapeBuf);
+  function fillShape(n) {
+    var a = shapeBuf.array, i, t, u, s, x, y, z, k;
+    for (i = 0; i < total; i++) {
+      t = Math.random() * 6.283; u = Math.random() * 6.283;
+      if (n === 'Ring') { s = 6 + 1.3 * Math.cos(u); x = s * Math.cos(t); y = s * Math.sin(t); z = 0.8 * Math.sin(u); }
+      else if (n === 'Sphere') { k = Math.random() * 2 - 1; s = Math.sqrt(1 - k * k); u = 6 * (0.92 + 0.08 * Math.random()); x = s * Math.cos(t) * u; y = s * Math.sin(t) * u; z = k * u; }
+      else { k = Math.pow(Math.random(), 0.4) * 0.38; x = 16 * Math.pow(Math.sin(t), 3) * k; y = (13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * k + 0.5; z = gauss() * 0.9 * k * 2; }
+      a[i * 3] = x; a[i * 3 + 1] = y; a[i * 3 + 2] = z;
+    }
+    shapeBuf.needsUpdate = true;
+  }
+
+  var U = {
+    uTime: { value: 0 }, uPhase: { value: 0 }, uPx: { value: renderer.getPixelRatio() },
+    uTwist: { value: cur.twist }, uSpread: { value: cur.spread }, uTint: { value: new THREE.Vector3().fromArray(cur.tint) },
+    uMouse: { value: new THREE.Vector2(999, 999) }, uHover: { value: 0 }, uRadius: { value: 3.6 },
+    uBass: { value: 0 }, uMid: { value: 0 }, uHigh: { value: 0 },
+    uMorph: { value: 0 }, uWave: { value: 99 }, uWaveAmp: { value: 0 }, uPull: { value: 0 }, uWaveC: { value: new THREE.Vector2() }
+  };
+  var mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, uniforms: U,
+    vertexShader: [
+      'attribute float aR; attribute float aArm; attribute float aSc; attribute float aZ; attribute float aS; attribute float aSeed; attribute vec3 aC; attribute vec3 aShape;',
+      'uniform float uTime, uPhase, uPx, uTwist, uSpread, uHover, uRadius, uBass, uMid, uHigh, uMorph, uWave, uWaveAmp, uPull; uniform vec2 uMouse, uWaveC; uniform vec3 uTint;',
+      'varying vec3 vC;',
+      'void main(){',
+      '  float omega = 0.3 + 0.9 / (1.0 + aR * 0.3);                       // inner stars orbit faster',
+      '  float ang = aArm + log(1.0 + aR) * uTwist + aSc * uSpread * (1.0 + aR * 0.04) + uPhase * omega;',
+      '  float rr = aR * (1.0 + uBass * 0.05);                              // bass makes the whole galaxy breathe',
+      '  vec3 p = vec3(cos(ang) * rr, sin(ang) * rr, aZ);',
+      '  float ph = uPhase * 0.3;                                            // morph target, slowly turning',
+      '  vec3 ps = vec3(aShape.x * cos(ph) + aShape.z * sin(ph), aShape.y, aShape.z * cos(ph) - aShape.x * sin(ph)) * (1.0 + uBass * 0.05);',
+      '  p = mix(p, ps, uMorph);',
+      '  vec2 dv = p.xy - uMouse; float dist = length(dv);                  // hover float',
+      '  float f = smoothstep(uRadius, 0.0, dist); f = f * f * (3.0 - 2.0 * f) * uHover;',
+      '  vec2 dir = dv / max(dist, 0.001);',
+      '  vec2 wob = vec2(sin(uTime * 1.2 + aSeed * 6.0), cos(uTime * 1.0 + aSeed * 4.0));',
+      '  float mag = f * (0.9 + 0.6 * sin(aSeed));                           // push away, or pull in while the pointer is held',
+      '  p.xy += dir * mix(mag, -min(mag * 1.3, dist), uPull) + wob * f * 0.45;',
+      '  p.z += f * (0.8 + 1.2 * fract(aSeed));',
+      '  vec2 wd2 = p.xy - uWaveC; float wl = length(wd2);                  // shockwave ring from a beat or a click',
+      '  float wv = smoothstep(1.8, 0.0, abs(wl - uWave)) * uWaveAmp;',
+      '  p.xy += wd2 / max(wl, 0.001) * wv * 0.9; p.z += wv * 1.3;',
+      '  vec4 mv = modelViewMatrix * vec4(p, 1.0);',
+      '  float tw = 0.88 + (0.12 + uHigh * 0.35) * sin(uTime * (0.9 + uHigh * 3.0) + aSeed * 6.0);   // highs make stars sparkle',
+      '  float coreW = smoothstep(6.0, 0.0, aR);',
+      '  gl_PointSize = aS * tw * (1.0 + f * 0.7 + wv * 0.8 + uBass * 1.1 * coreW) * uPx * (30.0 / -mv.z);   // bass pulses the core',
+      '  gl_Position = projectionMatrix * mv;',
+      '  vC = mix(aC, uTint, 0.45) * (1.0 + uMid * 0.4);',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'varying vec3 vC;',
+      'void main(){',
+      '  float d = length(gl_PointCoord - 0.5) * 2.0; if (d > 1.0) discard;',
+      '  float k = smoothstep(0.35, 0.0, d) + pow(1.0 - d, 3.0) * 0.55;',
+      '  gl_FragColor = vec4(vC * k, k * 0.9);',
+      '}'
+    ].join('\n')
+  });
+  scene.add(new THREE.Points(geo, mat));
+
+  var bg = new Float32Array(2100);
+  for (var j = 0; j < 700; j++) { bg[j*3] = (Math.random()-.5)*90; bg[j*3+1] = (Math.random()-.5)*50; bg[j*3+2] = -20 - Math.random()*20; }
+  var bgGeo = new THREE.BufferGeometry(); bgGeo.setAttribute('position', new THREE.BufferAttribute(bg, 3));
+  scene.add(new THREE.Points(bgGeo, new THREE.PointsMaterial({ size: .12, color: 0x9fb4d8, transparent: true, opacity: .5, depthWrite: false })));
+
+  /* ============ HOVER: pointer -> galaxy plane, eased ============ */
+  var mouse = new THREE.Vector2(999, 999), target = new THREE.Vector2(999, 999), hover = 0, hoverT = 0;
+  function onMove(e) {
+    var r = canvas.getBoundingClientRect();
+    var nx = ((e.clientX - r.left) / r.width) * 2 - 1, ny = -(((e.clientY - r.top) / r.height) * 2 - 1);
+    var halfH = Math.tan(22.5 * Math.PI / 180) * camera.position.z;
+    target.set(nx * halfH * camera.aspect, ny * halfH);
+    if (hover < .02) mouse.copy(target);
+    hoverT = 1;
+  }
+  canvas.addEventListener('pointermove', onMove);
+  var waveR = 99, waveS = 1, lastBass = 0, lastBeat = 0, pull = 0, pullT = 0, shapeHave = 'Galaxy', shapeWant = 'Galaxy', morphT = 0, downT = 0, bloomOn = true;
+  function fireWave(x, y, s) { U.uWaveC.value.set(x, y); waveR = 0; waveS = s; }
+  canvas.addEventListener('pointerdown', function (e) { onMove(e); pullT = 1; downT = performance.now(); });
+  canvas.addEventListener('pointerup', function () { pullT = 0; if (performance.now() - downT < 250) fireWave(target.x, target.y, 1.4); });
+  canvas.addEventListener('pointerleave', function () { hoverT = 0; });
+  canvas.addEventListener('pointerup', function (e) { if (e.pointerType === 'touch') hoverT = 0; });
+
+  /* ============ AUDIO: Web Audio synth + analyser (also works with your own file) ============ */
+  var AC, master, analyser, out, fft, micOn = false, micStream = null, noiseBuf, timer = null, step = 0, nextT = 0, fileMode = false, fileNode = null, playing = false;
+  var audioEl = new Audio(); audioEl.loop = true;
+  var statusEl = document.getElementById('status'), playBtn = document.getElementById('play');
+
+  function initAudio() {
+    if (AC) return;
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = .7;
+    analyser = AC.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = .8;
+    master.connect(analyser); out = AC.createGain(); analyser.connect(out); out.connect(AC.destination);
+    fft = new Uint8Array(analyser.frequencyBinCount);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * .08, AC.sampleRate);
+    var d = noiseBuf.getChannelData(0); for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  function tone(type, f, t, dur, vol) {
+    var o = AC.createOscillator(), g = AC.createGain(); o.type = type; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + Math.min(.12, dur / 3)); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + .05);
+  }
+  function kick(t) {
+    var o = AC.createOscillator(), g = AC.createGain(); o.frequency.setValueAtTime(130, t); o.frequency.exponentialRampToValueAtTime(40, t + .2);
+    g.gain.setValueAtTime(1, t); g.gain.exponentialRampToValueAtTime(.001, t + .28); o.connect(g); g.connect(master); o.start(t); o.stop(t + .3);
+  }
+  function hat(t) {
+    var s = AC.createBufferSource(), h = AC.createBiquadFilter(), g = AC.createGain(); s.buffer = noiseBuf; h.type = 'highpass'; h.frequency.value = 7000;
+    g.gain.setValueAtTime(.25, t); g.gain.exponentialRampToValueAtTime(.001, t + .06); s.connect(h); h.connect(g); g.connect(master); s.start(t);
+  }
+  function scheduleStep(s, t) {
+    var m = MOODS[mood], k = s % 16, bar = Math.floor(s / 16), ch = m.chords[bar % m.chords.length], sec = 60 / m.bpm / 4;
+    if (m.kick.indexOf(k) > -1) kick(t);
+    if (m.hat.indexOf(k) > -1) hat(t);
+    if (k === 0) { ch.forEach(function (f, i) { tone('triangle', f * (i % 2 ? 1.003 : 1), t, sec * 16, .09); }); }
+    if (k % 8 === 0) tone('sine', ch[0] / 2, t, sec * 8, .35);
+    if (m.bpm > 100 && k % 2 === 0) tone('sawtooth', ch[(k / 2) % ch.length] * 2, t, sec * 1.6, .03);
+  }
+  function startSynth() {
+    nextT = AC.currentTime + .05; step = 0;
+    timer = setInterval(function () {
+      while (nextT < AC.currentTime + .15) { scheduleStep(step, nextT); nextT += 60 / MOODS[mood].bpm / 4; step++; }
+    }, 25);
+  }
+  function stopSynth() { clearInterval(timer); timer = null; }
+
+  playBtn.onclick = function () {
+    initAudio(); AC.resume(); if (micOn) stopMic();
+    if (!playing) {
+      playing = true; playBtn.textContent = '❚❚ Pause';
+      if (fileMode) audioEl.play(); else startSynth();
+      statusEl.textContent = fileMode ? 'Playing your track' : 'Generated live in your browser: ' + mood;
+    } else {
+      playing = false; playBtn.textContent = '▶ Play';
+      if (fileMode) audioEl.pause(); else stopSynth();
+      statusEl.textContent = 'Paused';
+    }
+  };
+  document.getElementById('file').onchange = function (e) {
+    var f = e.target.files[0]; if (!f) return;
+    initAudio(); AC.resume(); if (micOn) stopMic(); stopSynth();
+    audioEl.src = URL.createObjectURL(f);
+    if (!fileNode) { fileNode = AC.createMediaElementSource(audioEl); fileNode.connect(master); }
+    fileMode = true; playing = true; audioEl.play(); playBtn.textContent = '❚❚ Pause'; statusEl.textContent = 'Playing your track: ' + f.name;
+  };
+
+  /* ============ MICROPHONE: analyser only, so there is no speaker feedback ============ */
+  var micBtn = document.getElementById('mic');
+  function stopMic() {
+    if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); });
+    micStream = null; micOn = false; playing = false; if (out) out.gain.value = 1;
+    micBtn.className = ''; playBtn.textContent = '▶ Play'; statusEl.textContent = 'Mic off';
+  }
+  micBtn.onclick = function () {
+    if (micOn) { stopMic(); return; }
+    initAudio(); AC.resume();
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+      stopSynth(); audioEl.pause(); micStream = s; micOn = true; playing = true;
+      AC.createMediaStreamSource(s).connect(analyser); out.gain.value = 0;
+      micBtn.className = 'on'; playBtn.textContent = '▶ Play'; statusEl.textContent = 'Listening to your microphone';
+    }).catch(function () { statusEl.textContent = 'Microphone access was blocked'; });
+  };
+
+  /* ============ SHAPE BUTTONS ============ */
+  var shapesEl = document.getElementById('shapes');
+  ['Galaxy', 'Ring', 'Sphere', 'Heart'].forEach(function (n) {
+    var b = document.createElement('button'); b.textContent = n; if (n === 'Galaxy') b.className = 'on';
+    b.onclick = function () { shapeWant = n; [].forEach.call(shapesEl.children, function (c) { c.className = c.textContent === n ? 'on' : ''; }); };
+    shapesEl.appendChild(b);
+  });
+
+  /* ============ MOOD BUTTONS ============ */
+  var moodsEl = document.getElementById('moods');
+  names.forEach(function (n) {
+    var b = document.createElement('button'); b.textContent = n; if (n === mood) b.className = 'on';
+    b.onclick = function () { mood = n; [].forEach.call(moodsEl.children, function (c) { c.className = c.textContent === n ? 'on' : ''; }); };
+    moodsEl.appendChild(b);
+  });
+
+  /* ============ LOOP: ease everything, read audio bands, render ============ */
+  function resize() {
+    var w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); if (composer) composer.setSize(w, h);
+    camera.aspect = w / h; camera.updateProjectionMatrix(); camera.position.z = w / h < 1 ? 42 : 30;
+  }
+  scene.background = new THREE.Color(0x02030a);
+  var composer = new THREE.EffectComposer(renderer);                      // bloom: bright areas bleed light into their surroundings
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  composer.addPass(new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.55, 0.12));
+  function setBloom(on) { bloomOn = on; document.getElementById('bloom').className = on ? 'on' : ''; }
+  document.getElementById('bloom').onclick = function () { setBloom(!bloomOn); };
+  function setPR(v) { renderer.setPixelRatio(v); composer.setPixelRatio(v); U.uPx.value = v; resize(); }
+  function adapt(fps) {                                                   // adaptive quality: lower resolution first, then drop bloom
+    var pr = renderer.getPixelRatio();
+    if (fps < 40 && pr > 1) setPR(Math.max(1, pr - .5)); else if (fps < 28 && bloomOn) setBloom(false);
+  }
+  var fr = 0, fpsT = 0;
+  addEventListener('resize', resize); resize();
+
+  var clock = new THREE.Clock(), reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var sm = { b: 0, m: 0, h: 0 };
+  function band(a, b) { var s = 0; for (var i = a; i < b; i++) s += fft[i]; return s / ((b - a) * 255); }
+  function follow(k, v) { sm[k] += (v - sm[k]) * (v > sm[k] ? .5 : .08); return sm[k]; }  // fast attack, slow release
+
+  (function loop() {
+    var raw = clock.getDelta(), dt = Math.min(raw, .033), k = 1 - Math.exp(-dt * 6), km = 1 - Math.exp(-dt * 1.5);
+    var M = MOODS[mood];
+    cur.speed += (M.speed - cur.speed) * km; cur.twist += (M.twist - cur.twist) * km; cur.spread += (M.spread - cur.spread) * km;
+    for (var i = 0; i < 3; i++) cur.tint[i] += (M.tint[i] - cur.tint[i]) * km;
+
+    var bass = 0, mid = 0, high = 0;
+    if (analyser && playing) {
+      analyser.getByteFrequencyData(fft);
+      bass = Math.min(1, Math.pow(band(0, 4), 1.4) * 1.8); mid = Math.min(1, band(4, 25) * 2); high = Math.min(1, band(25, 90) * 3);
+    }
+    U.uBass.value = follow('b', bass); U.uMid.value = follow('m', mid); U.uHigh.value = follow('h', high);
+
+    /* beat detection: a sudden jump in bass energy fires a shockwave from the core */
+    var tNow = performance.now() / 1000;
+    if (playing && bass - lastBass > .12 && tNow - lastBeat > .25) { fireWave(0, 0, 1); lastBeat = tNow; }
+    lastBass = bass;
+    waveR += dt * 14; U.uWave.value = waveR; U.uWaveAmp.value = Math.max(0, 1 - waveR / 18) * waveS;
+    pull += (pullT - pull) * k; U.uPull.value = pull;
+
+    /* shape morph: fade back to the galaxy, swap the target shape, then fade into it */
+    if (shapeHave !== shapeWant) { morphT = 0; if (U.uMorph.value < .03) { if (shapeWant !== 'Galaxy') fillShape(shapeWant); shapeHave = shapeWant; } }
+    else morphT = shapeHave === 'Galaxy' ? 0 : 1;
+    U.uMorph.value += (morphT - U.uMorph.value) * (1 - Math.exp(-dt * 3));
+
+    if (!reduce) { U.uTime.value += dt; U.uPhase.value += dt * cur.speed * (1 + sm.m * .8); }   // accumulate phase so speed changes never jump
+    U.uTwist.value = cur.twist; U.uSpread.value = cur.spread; U.uTint.value.fromArray(cur.tint);
+
+    mouse.lerp(target, k); hover += (hoverT - hover) * k;
+    U.uMouse.value.copy(mouse); U.uHover.value = hover;
+    if (bloomOn) composer.render(); else renderer.render(scene, camera);
+    if (raw < .5) { fr++; fpsT += raw; if (fpsT > 1.5) { adapt(fr / fpsT); fr = 0; fpsT = 0; } }
+    requestAnimationFrame(loop);
+  })();
+})();
+</script>
+</body>
+</html>
