@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/galaxy.svg" alt="Rotating spiral galaxy of glowing stars" width="100%">
+  <img src="galaxy.svg" alt="Rotating spiral galaxy of glowing stars" width="100%">
 </p>
 
 <h1 align="center">Mood Galaxy</h1>
