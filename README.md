@@ -6,7 +6,7 @@
 
 <p align="center">
   A music-reactive particle galaxy that runs entirely in the browser.<br>
-  About 45,000 GPU-driven stars that react to sound, your cursor and the mood you pick.
+  About 45,000 GPU-driven stars that react to sound, your cursor, and the mood you pick.
 </p>
 
 <p align="center">
