@@ -62,7 +62,7 @@ A few details worth knowing:
 
 ## Run it locally
 
-The whole project is one file, so there's nothing to install.
+The whole project is one file, so there is nothing to install.
 
 ```bash
 git clone https://github.com/Urpita/mood-galaxy.git
